@@ -55,6 +55,8 @@ public static class VerifyCommand {
       Concat(DafnyCommands.ConsoleOutputOptions).
       Concat(DafnyCommands.ResolverOptions);
 
+
+  private static Dictionary<IToken, INode> tokenToNode = new();
   public static async Task<int> HandleVerification(DafnyOptions options) {
     if (options.Get(CommonOptionBag.VerificationCoverageReport) != null) {
       options.TrackVerificationCoverage = true;
@@ -72,7 +74,31 @@ public static class VerifyCommand {
       var verificationSummarized = ReportVerificationSummary(compilation, verificationResults);
       var proofDependenciesReported = ReportProofDependencies(compilation, resolution, verificationResults);
       var verificationResultsLogged = LogVerificationResults(compilation, resolution, verificationResults);
+
+      // Build the token index before verification starts
+      foreach (var module in resolution.ResolvedProgram.Modules()) {
+        IndexNode(module);
+      }
+
+      // our new hook: collect & mark error locations
       compilation.VerifyAllLazily().ToObservable().Subscribe(verificationResults);
+      //compilation.VerifyAllLazily().ToObservable().Subscribe(completed => {
+      //  var results = completed.Results;
+      //  foreach (var result in completed.Results) {
+      //    var token = result.Task.Token;
+      //    var verifoutcome = result.Result.Outcome;
+      //    if(verifoutcome != SolverOutcome.Valid){
+      //      if (tokenToNode.TryGetValue(token, out var node)) {
+      //        Console.WriteLine($"Verification result for node: {node.GetType().Name}");
+      //        // Optionally dump more info: node.ToString(), origin, etc.
+      //      } else {
+      //        Console.WriteLine($"Token not found in AST index: {token.filename} line {token.line}");
+      //      }
+      //    } 
+      //  } 
+      //  verificationResults.OnNext(completed); // forward result to pipeline
+      //});
+
       await verificationSummarized;
       await verificationResultsLogged;
       await proofDependenciesReported;
@@ -81,7 +107,23 @@ public static class VerifyCommand {
     return await compilation.GetAndReportExitCode();
   }
 
-  public static async Task ReportVerificationSummary(
+
+public static void IndexNode(INode node) {
+  IOrigin origin = node.Origin;
+
+  if (origin?.StartToken != null && origin.StartToken.IsValid) {
+    tokenToNode[origin.StartToken] = node;
+  }
+
+  if (node.Children != null) {
+    foreach (var child in node.Children) {
+      IndexNode(child);
+    }
+  }
+
+}
+ 
+public static async Task ReportVerificationSummary(
     CliCompilation cliCompilation,
     IObservable<CanVerifyResult> verificationResults) {
     var statistics = new VerificationStatistics();
