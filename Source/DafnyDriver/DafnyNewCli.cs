@@ -33,6 +33,7 @@ public static class DafnyNewCli {
     AddCommand(ResolveCommand.Create());
     AddCommand(VerifyCommand.Create());
     AddCommand(GradualCommand.Create());
+    AddCommand(LaurelFixPositionCommand.Create());
     AddCommand(AssertionInferer.Create());
     AddCommand(AssertTreeCommand.Create());
     AddCommand(BuildCommand.Create());
