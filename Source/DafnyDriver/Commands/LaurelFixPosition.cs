@@ -138,10 +138,21 @@ public static class LaurelFixPositionCommand {
       }
       Console.WriteLine("It is a method that could not be verified"); 
       // Now that we have the exact Method AST node, process each counterexample
-      foreach (var verificationResult in methodResult.Results) {
+     foreach (var verificationResult in methodResult.Results) {
         foreach (var counterExample in verificationResult.Result.CounterExamples) {
-          var originalToken = ConvertBoogieToken(counterExample.FailingAssert.tok);
-          LocateAndReplaceAssert(method, originalToken);
+          if(counterExample is ReturnCounterexample returnCounterexample) {
+              if (returnCounterexample.FailingReturn is ReturnCmd failReturn) {
+                var originalToken = ConvertBoogieToken(failReturn.tok);
+                if (originalToken is Token token) {
+                  // Postcondition fail working fail at no particular branch
+                  LocateFailedReturnAndAddAssertionAtEnd(method, token.Next); 
+                }
+              }
+          } else {
+            // Regular Assertion working
+            var originalToken = ConvertBoogieToken(counterExample.FailingAssert.tok);
+            LocateAndReplaceAssert(method, originalToken);
+          }
         }
       }
   }
@@ -154,7 +165,41 @@ public static class LaurelFixPositionCommand {
     }
     return dafnyToken;
   }
-  
+ 
+  private static void LocateFailedReturnAndAddAssertionAtEnd(Method method, IToken originalToken) {
+    var visitor = new FindExpressionAndParentByTokenVisitor(originalToken);
+    visitor.VisitMethod(method);
+    // Original token is the token with the first elemnt on the body of the method if arrived here is to insert on the end of the body the assertion
+
+    // Create a Dummy assertion to be easy to use (however would be better to insert a comment but a comment is not a statement so here it is
+    var lit_dummy1 = new LiteralExpr(method.Origin, 123456789);
+    var lit_dummy2 = new LiteralExpr(method.Origin, 123456789);
+    var binaryExpression = new BinaryExpr(method.Origin, BinaryExpr.Opcode.Eq,  lit_dummy1, lit_dummy2);
+    var dummyAssert = new AssertStmt(method.Origin, binaryExpression, null, null);
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+     
+    if (visitor.MatchingStatementWithAllParent.Count == 0) {
+      return;
+    }
+
+    // We only care about the first match (expr + its parent chain).
+    var (failed_stmt, parents) = visitor.MatchingStatementWithAllParent[0];
+    Console.WriteLine($"Found failing location at (Line:{originalToken.line}, Col:{originalToken.col}).");
+
+    // AssertStmt newDummyAssert = new AssertStmt(
+    //   AssertStmt.Origin,
+    // );
+
+    // Walk parents in reverse (deepest child → root)
+    foreach (var parent in parents.Reverse()) { // Transverse stack in reverse order
+      // Add a the end of parent block the dummy assertion
+      if (parent is BlockStmt blockStmt) { // Look in parent block for the given assertion
+        blockStmt.Body.Insert(blockStmt.Body.Count, dummyAssert);
+        Console.WriteLine("Inserted dummy assertion before the found assertion.");
+        return;
+      }
+    }
+  }
   // 4) Run the visitor, find the AssertStmt, build an ExpectStmt, and swap it in.
   private static void LocateAndReplaceAssert(Method method, IToken originalToken) {
     var visitor = new FindExpressionAndParentByTokenVisitor(originalToken);
