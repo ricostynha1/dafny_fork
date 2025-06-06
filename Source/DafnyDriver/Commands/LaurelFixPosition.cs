@@ -136,22 +136,31 @@ public static class LaurelFixPositionCommand {
         // If it's not a normal Method (e.g. a function or something else), bail out for now.
         return;
       }
-      Console.WriteLine("It is a method that could not be verified"); 
-      // Now that we have the exact Method AST node, process each counterexample
+     // Now that we have the exact Method AST node, process each counterexample
      foreach (var verificationResult in methodResult.Results) {
         foreach (var counterExample in verificationResult.Result.CounterExamples) {
           if(counterExample is ReturnCounterexample returnCounterexample) {
               if (returnCounterexample.FailingReturn is ReturnCmd failReturn) {
                 var originalToken = ConvertBoogieToken(failReturn.tok);
-                if (originalToken is Token token) {
-                  // Postcondition fail working fail at no particular branch
-                  LocateFailedReturnAndAddAssertionAtEnd(method, token.Next); 
+                if (originalToken is SourceOrigin sourceOrig) {
+                  // It is a source token, probably a return on a function
+                  var endTok = sourceOrig.EndToken;
+                  LocateFailedReturnAndAddAssertionAtEnd(method, endTok); 
+                } else if (originalToken is Token token) {
+                  // It is not source token (probably beginning { of body (here it is inserting on top isntead of end will correct in the end)
+                  var next_token = token.Next;
+                  // This will add at the end of the outter block statement the Assert
+                  LocateFailedReturnAndAddAssertionAtEnd(method, next_token);  
                 }
               }
           } else {
             // Regular Assertion working
             var originalToken = ConvertBoogieToken(counterExample.FailingAssert.tok);
-            LocateAndReplaceAssert(method, originalToken);
+            if (originalToken is SourceOrigin sourceOrig) {
+              // It is a source token, probably a return on a function
+              var endTok = sourceOrig.EndToken;
+              LocateFailedReturnAndAddAssertionAtEnd(method, endTok);
+            }
           }
         }
       }
@@ -159,11 +168,7 @@ public static class LaurelFixPositionCommand {
   
   // 3) Turn a Boogie token to the “true” Dafny token (e.g. a SourceOrigin’s StartToken).
   private static IToken ConvertBoogieToken(IToken boogieTok) {
-    IToken dafnyToken = BoogieGenerator.ToDafnyToken(true, boogieTok);
-    if (dafnyToken is SourceOrigin origin) {
-      return origin.StartToken;
-    }
-    return dafnyToken;
+    return BoogieGenerator.ToDafnyToken(true, boogieTok);
   }
  
   private static void LocateFailedReturnAndAddAssertionAtEnd(Method method, IToken originalToken) {
@@ -177,65 +182,39 @@ public static class LaurelFixPositionCommand {
     var binaryExpression = new BinaryExpr(method.Origin, BinaryExpr.Opcode.Eq,  lit_dummy1, lit_dummy2);
     var dummyAssert = new AssertStmt(method.Origin, binaryExpression, null, null);
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-     
-    if (visitor.MatchingStatementWithAllParent.Count == 0) {
+
+    var n = (visitor.MatchingStatementWithAllParent.Count);
+    if (n == 0) {
       return;
     }
 
     // We only care about the first match (expr + its parent chain).
-    var (failed_stmt, parents) = visitor.MatchingStatementWithAllParent[0];
-    Console.WriteLine($"Found failing location at (Line:{originalToken.line}, Col:{originalToken.col}).");
+    var (failed_stmt, parents) = visitor.MatchingStatementWithAllParent[n-1]; // last elemnt correponds to the actual smaller statemnt that holds the token
 
-    // AssertStmt newDummyAssert = new AssertStmt(
-    //   AssertStmt.Origin,
-    // );
-
+    if (failed_stmt is WhileStmt whileStmt) {
+      // If most inner expression that contains the last token that failed is a while_stmt
+      // this means that what it failed was an specificaiton invarinat/decreasese etc in the while
+      // So we will had an assertion at the end of the while to the end of the while the assert
+      var whileBody = whileStmt.Body;
+      whileBody.Body.Insert(whileBody.Body.Count, dummyAssert);
+      return;
+    }
     // Walk parents in reverse (deepest child → root)
     foreach (var parent in parents.Reverse()) { // Transverse stack in reverse order
       // Add a the end of parent block the dummy assertion
       if (parent is BlockStmt blockStmt) { // Look in parent block for the given assertion
-        blockStmt.Body.Insert(blockStmt.Body.Count, dummyAssert);
-        Console.WriteLine("Inserted dummy assertion before the found assertion.");
-        return;
-      }
-    }
-  }
-  // 4) Run the visitor, find the AssertStmt, build an ExpectStmt, and swap it in.
-  private static void LocateAndReplaceAssert(Method method, IToken originalToken) {
-    var visitor = new FindExpressionAndParentByTokenVisitor(originalToken);
-    visitor.VisitMethod(method);
-
-     // Create a Dummy assertion to be easy to use (however would be better to insert a comment but a comment is not a statement so here it is
-     var lit_dummy1 = new LiteralExpr(method.Origin, 123456789);
-     var lit_dummy2 = new LiteralExpr(method.Origin, 123456789);
-     var binaryExpression = new BinaryExpr(method.Origin, BinaryExpr.Opcode.Eq,  lit_dummy1, lit_dummy2);
-     var dummyAssert = new AssertStmt(method.Origin, binaryExpression, null, null);
-     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-     
-    if (visitor.MatchingStatementWithAllParent.Count == 0) {
-       return;
-    }
-
-    // We only care about the first match (expr + its parent chain).
-    var (failed_stmt, parents) = visitor.MatchingStatementWithAllParent[0];
-    Console.WriteLine($"Found failing location at (Line:{originalToken.line}, Col:{originalToken.col}).");
-
-   // AssertStmt newDummyAssert = new AssertStmt(
-   //   AssertStmt.Origin,
-   // );
-
-    // Walk parents in reverse (deepest child → root)
-    foreach (var parent in parents.Reverse()) { // Transverse stack in reverse order
-      // Step B: Once we have foundAssert, look for its enclosing BlockStmt
-      if (parent is BlockStmt blockStmt) { // Look in parent block for the given assertion
-        for (int i = 0; i < blockStmt.Body.Count; i++) {
-          if (blockStmt.Body[i] == failed_stmt) {
-            // Insert dummyAssert before the failed assertion
-            blockStmt.Body.Insert(i, dummyAssert);
-            Console.WriteLine("Inserted dummy assertion before the found assertion.");
-            return;
+        var body_n = blockStmt.Body.Count;
+        if (body_n > 0) {
+          for (var i = body_n - 1; i >= 0; i--) {
+            if (failed_stmt.Equals(blockStmt.Body[i])) {
+              //Insert Dummy assertion at top
+              blockStmt.Body.Insert(i, dummyAssert);
+            }
           }
+        } else {
+          blockStmt.Body.Insert(0, dummyAssert); 
         }
+        return;
       }
     }
   }
@@ -258,7 +237,7 @@ public static class LaurelFixPositionCommand {
     protected override void VisitStatement(Statement stmt, IASTVisitorContext context) {
 
       
-      if (TokensMatch(stmt.StartToken, targetToken)) { // in case of asset this will be an assert
+      if (TokensInStatement(stmt)) { // in case of asset this will be an assert
         var parent = parents.Count > 0 ? parents.Peek() : null;
         if (parent is Node node) {
           MatchingStatement.Add((stmt, node));
@@ -271,8 +250,13 @@ public static class LaurelFixPositionCommand {
       parents.Pop();
     }
 
-    private bool TokensMatch(IToken a, IToken b) {
-      return a.line == b.line && a.col == b.col;
+    private bool TokensInStatement(Statement stmt) {
+      foreach (var token in stmt.CoveredTokens) {
+        if (token.Equals(targetToken)) {
+          return true;
+        }
+      }
+      return false;
     }
   }
 public static async Task ReportVerificationSummary(

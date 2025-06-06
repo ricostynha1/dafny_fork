@@ -11,6 +11,8 @@ using DafnyCore.Options;
 using DafnyDriver.Commands;
 using Microsoft.Boogie;
 using Microsoft.Dafny.Compilers;
+using Microsoft.Dafny.LanguageServer.IntegrationTest.Util;
+using VC;
 
 namespace Microsoft.Dafny;
 
@@ -56,7 +58,6 @@ public static class VerifyCommand {
       Concat(DafnyCommands.ResolverOptions);
 
 
-  private static Dictionary<IToken, INode> tokenToNode = new();
   public static async Task<int> HandleVerification(DafnyOptions options) {
     if (options.Get(CommonOptionBag.VerificationCoverageReport) != null) {
       options.TrackVerificationCoverage = true;
@@ -69,58 +70,105 @@ public static class VerifyCommand {
 
     if (resolution != null) {
       Subject<CanVerifyResult> verificationResults = new();
-
+      
       ReportVerificationDiagnostics(compilation, verificationResults);
+      //var verifyIdentifyFailed = VerifyFailedAssertion(compilation, resolution, verificationResults);
       var verificationSummarized = ReportVerificationSummary(compilation, verificationResults);
       var proofDependenciesReported = ReportProofDependencies(compilation, resolution, verificationResults);
       var verificationResultsLogged = LogVerificationResults(compilation, resolution, verificationResults);
 
-      // Build the token index before verification starts
-      foreach (var module in resolution.ResolvedProgram.Modules()) {
-        IndexNode(module);
-      }
-
       // our new hook: collect & mark error locations
+      //Old code
       compilation.VerifyAllLazily().ToObservable().Subscribe(verificationResults);
-      //compilation.VerifyAllLazily().ToObservable().Subscribe(completed => {
-      //  var results = completed.Results;
-      //  foreach (var result in completed.Results) {
-      //    var token = result.Task.Token;
-      //    var verifoutcome = result.Result.Outcome;
-      //    if(verifoutcome != SolverOutcome.Valid){
-      //      if (tokenToNode.TryGetValue(token, out var node)) {
-      //        Console.WriteLine($"Verification result for node: {node.GetType().Name}");
-      //        // Optionally dump more info: node.ToString(), origin, etc.
-      //      } else {
-      //        Console.WriteLine($"Token not found in AST index: {token.filename} line {token.line}");
-      //      }
-      //    } 
-      //  } 
-      //  verificationResults.OnNext(completed); // forward result to pipeline
-      //});
-
       await verificationSummarized;
       await verificationResultsLogged;
       await proofDependenciesReported;
     }
-
     return await compilation.GetAndReportExitCode();
   }
 
+public static async Task VerifyFailedAssertion(
+    CliCompilation compilation, 
+    ResolutionResult resolution,
+    IObservable<CanVerifyResult> verificationResults) {
 
-public static void IndexNode(INode node) {
-  IOrigin origin = node.Origin;
+    verificationResults.Subscribe(result => {
+    // We use an intermediate reporter so we can sort the diagnostics from all parts by token
+      var batchReporter = new BatchErrorReporter(compilation.Options);
+      foreach (var completed in result.Results) {
+        Compilation.ReportDiagnosticsInResult(compilation.Options, result.CanVerify.FullDafnyName,
+          BoogieGenerator.ToDafnyToken(true, completed.Task.Token),
+          (uint)completed.Result.RunTime.TotalSeconds,
+          completed.Result, batchReporter);
+      }
 
-  if (origin?.StartToken != null && origin.StartToken.IsValid) {
-    tokenToNode[origin.StartToken] = node;
-  }
+      foreach (var diagnostic in batchReporter.AllMessages.Order()) {
+        compilation.Compilation.Reporter.Message(diagnostic.Source, diagnostic.Level, diagnostic.ErrorId, diagnostic.Token,
+        diagnostic.Message);
+      }
+    });
+    /*
+    int error_number = 0;
+    bool has_error = false;
+    var failMethodsInfo = new List<CanVerifyResult>();
+    
+    verificationResults.Subscribe(result => {
+      foreach (var taskResult in result.Results) {
+        var runResult = taskResult.Result;
+        switch (runResult.Outcome) {
+          case SolverOutcome.Invalid:
+            error_number += 1;
+            has_error = true;
+            failMethodsInfo.Add(result);
+            break;
+        }
+      }
+    }, e => { }, () => { });
+    await verificationResults.WaitForComplete();
+    if (has_error)
+    {
+      var resolvedProgram = resolution.ResolvedProgram;
 
-  if (node.Children != null) {
-    foreach (var child in node.Children) {
-      IndexNode(child);
+      foreach (var methodResult in failMethodsInfo)
+      {
+        foreach (var verificationResult in methodResult.Results)
+        {
+          foreach (var counterExample in verificationResult.Result.CounterExamples)
+          {
+            // General info about the failed assertion/postcondition
+            var failingAssert = counterExample.FailingAssert;
+            Console.WriteLine($"Failed Expression: Line {failingAssert.Line}, Column {failingAssert.Col}, Expr: {failingAssert.Expr}");
+            // Use switch to branch on counterExample type
+            switch (counterExample)
+            {
+              case ReturnCounterexample returnExample:
+                foreach (var child in methodResult.CanVerify.Children)
+                {
+                  if (child is BlockStmt blockStmt)
+                  {
+                    var endTok = blockStmt.EndToken.EndToken;
+                    Console.WriteLine($"Failed Postcondition at method end: Line {endTok.line}, Column {endTok.col}");
+                  }
+                }
+                break;
+
+              case AssertCounterexample assertExample:
+                if (assertExample.FailingAssert.tok is SourceOrigin tok)
+                {
+                  Console.WriteLine($"Failed Assertion: Line {tok.EndToken.line}, Column {tok.EndToken.col}");
+                }
+                break;
+
+              // Optional: handle unknown counterexample types
+              default:
+                Console.WriteLine("Encountered an unknown counterexample type.");
+                break;
+            }
+          }
+        }
+      }
     }
-  }
-
+    */
 }
  
 public static async Task ReportVerificationSummary(
