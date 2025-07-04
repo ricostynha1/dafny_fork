@@ -140,19 +140,20 @@ public static class GradualCommand {
       // Now that we have the exact Method AST node, process each counterexample
       foreach (var verificationResult in methodResult.Results) {
         foreach (var counterExample in verificationResult.Result.CounterExamples) {
+          // Regular Assertion working
           var originalToken = ConvertBoogieToken(counterExample.FailingAssert.tok);
-          LocateAndReplaceAssert(method, originalToken);
+          if (originalToken is SourceOrigin sourceOrig) {
+            // It is a source token, probably a return on a function
+            var endTok = sourceOrig.EndToken;
+            LocateAndReplaceAssert(method, endTok);
+          }
         }
       }
   }
   
   // 3) Turn a Boogie token to the “true” Dafny token (e.g. a SourceOrigin’s StartToken).
   private static IToken ConvertBoogieToken(IToken boogieTok) {
-    IToken dafnyToken = BoogieGenerator.ToDafnyToken(true, boogieTok);
-    if (dafnyToken is SourceOrigin origin) {
-      return origin.StartToken;
-    }
-    return dafnyToken;
+    return BoogieGenerator.ToDafnyToken(true, boogieTok);
   }
   
   // 4) Run the visitor, find the AssertStmt, build an ExpectStmt, and swap it in.
@@ -160,43 +161,42 @@ public static class GradualCommand {
     var visitor = new FindExpressionAndParentByTokenVisitor(originalToken);
     visitor.VisitMethod(method);
 
-    if (visitor.MatchingExpressionsWithAllParent.Count == 0) {
+    if (visitor.MatchingStatementWithAllParent.Count == 0) {
       return;
     }
 
     // We only care about the first match (expr + its parent chain).
-    var (_, parents) = visitor.MatchingExpressionsWithAllParent[0];
-    Console.WriteLine($"Found failing location at (Line:{originalToken.line}, Col:{originalToken.col}).");
+    var (generalStmt, parents) = visitor.MatchingStatementWithAllParent[0];
+    AssertStmt assertStmt;
+    if (generalStmt is AssertStmt) {
+      assertStmt = (AssertStmt)generalStmt;
+    } else {
+      return;
+    }
 
-    AssertStmt foundAssert = null;
-    ExpectStmt newExpect = null;
-
+  Console.WriteLine($"Found failing location at (Line:{originalToken.line}, Col:{originalToken.col}).");
+    ExpectStmt newExpect = new ExpectStmt(
+      assertStmt.Origin,
+      assertStmt.Expr,
+      null,        // or null if you don’t want a message
+      assertStmt.Attributes
+    );
     // Walk parents in reverse (deepest child → root)
     foreach (var parent in parents.Reverse()) {
       // Step A: If this is the AssertStmt itself, build a new ExpectStmt placeholder
-      if (foundAssert == null && parent is AssertStmt assertStmt) {
-        Console.WriteLine("→ Found AssertStmt; building ExpectStmt...");
-        newExpect = new ExpectStmt(
-          assertStmt.Origin,
-          assertStmt.Expr,
-          assertStmt.Expr,        // or null if you don’t want a message
-          assertStmt.Attributes
-        );
-        foundAssert = assertStmt;
-        continue; // keep going until we find the BlockStmt
-      }
-
       // Step B: Once we have foundAssert, look for its enclosing BlockStmt
-      if (foundAssert != null && parent is BlockStmt blockStmt) {
-        var stmts = blockStmt.Body; // this is a List<Statement>
-        for (int j = 0; j < stmts.Count; j++) {
-          if (stmts[j] == foundAssert) {
-            Console.WriteLine("→ Replacing AssertStmt with ExpectStmt in BlockStmt.");
-            stmts[j] = newExpect;
-            return; // done with this counterexample
+      if (parent is BlockStmt blockStmt) {
+        var body_n = blockStmt.Body.Count;
+        if (body_n > 0) {
+          for (var i = body_n - 1; i >= 0; i--) {
+            if (assertStmt.Equals(blockStmt.Body[i])) {
+              //Insert Expect statement in the place of assert Stmt
+              blockStmt.Body[i] = newExpect;
+            }
           }
+        } else {
+          blockStmt.Body[0] = newExpect;
         }
-        // If we didn't find it in this BlockStmt, something’s off— but we can bail now.
         return;
       }
     }
@@ -204,8 +204,8 @@ public static class GradualCommand {
   
 // Visitor to find expression and its parent by token
   private class FindExpressionAndParentByTokenVisitor : ASTVisitor<IASTVisitorContext> {
-    public readonly List<(Expression Expr, INode Parent)> MatchingExpressions = new();
-    public readonly List<(Expression Expr, Stack<INode> Parents)> MatchingExpressionsWithAllParent = new();
+    public readonly List<(Statement Stmt, INode Parent)> MatchingStatement = new();
+    public readonly List<(Statement Stmt, Stack<INode> Parents)> MatchingStatementWithAllParent = new();
     private readonly IToken targetToken;
     private readonly Stack<INode> parents = new();
 
@@ -216,31 +216,30 @@ public static class GradualCommand {
     public override IASTVisitorContext GetContext(IASTVisitorContext context, bool inFunctionPostcondition) {
       return context;
     }
+    protected override void VisitStatement(Statement stmt, IASTVisitorContext context) {
 
-    protected override void VisitExpression(Expression expr, IASTVisitorContext context) {
-      if (TokensMatch(expr.StartToken, targetToken)) {
+      
+      if (TokensInStatement(stmt)) { // in case of asset this will be an assert
         var parent = parents.Count > 0 ? parents.Peek() : null;
         if (parent is Node node) {
-          MatchingExpressions.Add((expr, node));
+          MatchingStatement.Add((stmt, node));
           var parentsCopy = new Stack<INode>(parents); 
-          MatchingExpressionsWithAllParent.Add((expr, parentsCopy));
+          MatchingStatementWithAllParent.Add((stmt, parentsCopy));
         }
       }
-      parents.Push(expr);
-      base.VisitExpression(expr, context);
-      parents.Pop();
-    }
-
-    protected override void VisitStatement(Statement stmt, IASTVisitorContext context) {
       parents.Push(stmt);
       base.VisitStatement(stmt, context);
       parents.Pop();
     }
-
-    private bool TokensMatch(IToken a, IToken b) {
-      return a.line == b.line && a.col == b.col;
+    private bool TokensInStatement(Statement stmt) {
+      foreach (var token in stmt.CoveredTokens) {
+        if (token.Equals(targetToken)) {
+          return true;
+        }
+      }
+      return false;
     }
-  }
+  } 
 public static async Task ReportVerificationSummary(
     CliCompilation cliCompilation,
     IObservable<CanVerifyResult> verificationResults) {
